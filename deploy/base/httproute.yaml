@@ -1,0 +1,22 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: minato-vibe-mcp
+spec:
+  hostnames:
+    - minato-vibe-mcp.vibe.intility.dev
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: aa
+      namespace: envoy-gateway-system
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: minato-vibe-mcp
+          port: 80

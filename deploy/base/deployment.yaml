@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minato-vibe-mcp
+spec:
+  # Single replica: pending writes live in memory and tokens are scoped to
+  # the issuing pod. Don't HPA this without externalizing the store.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minato-vibe-mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minato-vibe-mcp
+    spec:
+      containers:
+        - name: app
+          image: app
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: MINATO_VIBE_MCP_URL
+              value: https://minato-vibe-mcp.vibe.intility.dev
+            - name: MINATO_VIBE_APP_URL_BASE
+              value: vibe.intility.dev
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /.well-known/oauth-protected-resource
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /.well-known/oauth-protected-resource
+              port: http
+            periodSeconds: 15

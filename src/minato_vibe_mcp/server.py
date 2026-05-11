@@ -18,7 +18,7 @@ from .github_api import GitHubClient, decode_file_content
 
 OWNER = "intility"
 PLATFORM_REPO = "minato-vibe"
-APP_URL_BASE = "aa349-1l5zl3.intility.dev"
+APP_URL_BASE = os.environ.get("MINATO_VIBE_APP_URL_BASE", "vibe.intility.dev")
 PENDING_WRITE_TTL_SECONDS = 300
 
 DNS_1123 = re.compile(r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")

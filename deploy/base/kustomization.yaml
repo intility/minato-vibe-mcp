@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: app-minato-vibe-mcp
+
+labels:
+  - includeSelectors: false
+    includeTemplates: true
+    pairs:
+      platform.intility.no/app: minato-vibe-mcp
+      app.kubernetes.io/managed-by: argocd
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - httproute.yaml
+  - networkpolicy.yaml
+  - resourcequota.yaml
+
+images:
+  # Initial state: platform placeholder so the URL is reachable as soon as
+  # the app registers. CI's first build rewrites both newName and newTag.
+  - name: app
+    newName: ghcr.io/intility/minato-vibe-placeholder
+    newTag: latest

@@ -1,0 +1,33 @@
+---
+# Default-deny baseline + the egress this MCP actually needs:
+#  - DNS (openshift-dns)
+#  - HTTPS to anywhere (so we can reach api.github.com)
+# Ingress only from the Envoy gateway namespace.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: minato-vibe-mcp-default
+spec:
+  endpointSelector: {}
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: envoy-gateway-system
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: openshift-dns
+            dns.operator.openshift.io/daemonset-dns: default
+      toPorts:
+        - ports:
+            - port: "5353"
+              protocol: UDP
+            - port: "5353"
+              protocol: TCP
+    # HTTPS to the public internet — primarily api.github.com.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
