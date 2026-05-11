@@ -59,11 +59,11 @@ spec:
               memory: 256Mi
           readinessProbe:
             httpGet:
-              path: /.well-known/oauth-protected-resource
+              path: /.well-known/oauth-protected-resource/mcp
               port: http
             periodSeconds: 5
           livenessProbe:
             httpGet:
-              path: /.well-known/oauth-protected-resource
+              path: /.well-known/oauth-protected-resource/mcp
               port: http
             periodSeconds: 15
