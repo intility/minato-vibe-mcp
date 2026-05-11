@@ -11,7 +11,9 @@ Each user authenticates with their own GitHub personal access token, which doubl
 | `whoami` | Returns the GitHub identity of the authenticated user. |
 | `list_templates` | Returns the two golden-path templates (`react-vibe-template`, `react-go-template`). |
 | `create_app(name, template?, description?)` | Creates `intility/<name>` from the chosen template **as a private repo**, running as the authenticated user. The MCP never creates public repos. |
-| `read_file(repo, path, ref?)` | Reads a file from `intility/<repo>`. |
+| `repo_overview(repo, ref?)` | **Call this first when starting work on a repo.** One round-trip returns the full file tree + README + common manifests (package.json, pyproject.toml, go.mod, justfile, Dockerfile). Replaces 10+ exploration calls. |
+| `read_file(repo, path, ref?)` | Reads a single file from `intility/<repo>`. For multiple files, prefer `read_files`. |
+| `read_files(repo, paths, ref?)` | Reads several files in parallel — one round-trip instead of N. |
 | `list_files(repo, path?, ref?)` | Lists a directory in `intility/<repo>`. |
 | `write_file(repo, path, content, message, branch?)` | **Stages** a write. Returns a unified diff + confirmation token. Does NOT commit. |
 | `confirm_write(token)` | Commits a write previously staged by `write_file`. Single-use, expires 5 min, scoped to the user. |

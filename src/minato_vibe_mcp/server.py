@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import difflib
 import os
 import re
@@ -143,10 +144,18 @@ mcp: FastMCP = FastMCP(
         "platform. Each user authenticates with their own GitHub personal "
         "access token, which is also the Bearer token for the MCP. All "
         "operations run as the authenticated GitHub user.\n\n"
-        "Use `list_templates` + `create_app` to scaffold a new app, and "
-        "`read_file`/`list_files`/`write_file`/`confirm_write` to vibecode "
-        "against an existing one. Writes to `main` deploy automatically in "
-        "~50s via the platform's GitOps loop.\n\n"
+        "EXPLORATION — when starting on a repo, call `repo_overview(repo)` "
+        "FIRST. It returns the full file tree plus README and common "
+        "manifests (package.json, pyproject.toml, go.mod, justfile, "
+        "Dockerfile) in a single round-trip. This replaces 10+ "
+        "list_files/read_file calls. For multiple specific files, use "
+        "`read_files(repo, paths)` to fetch them in parallel — not a loop "
+        "of read_file calls.\n\n"
+        "CREATION — `list_templates` + `create_app` to scaffold a new app.\n\n"
+        "EDITING — `write_file` then `confirm_write` to land a change. "
+        "Writes to `main` go through a PR that auto-merges; "
+        "release-please then drives the release + build + deploy. End to "
+        "end push-to-live is a few minutes.\n\n"
         "WRITES ARE TWO-STEP: `write_file` stages a change and returns a "
         "diff + confirmation token but does NOT commit. The human must "
         "approve, then `confirm_write(token)` commits. Always show the diff "
@@ -294,6 +303,107 @@ async def list_files(repo: str, path: str = "", ref: str | None = None) -> dict:
             ]
         }
     return {"raw": data}
+
+
+# Files to fetch alongside the tree in repo_overview. Most apps will have a
+# subset; we fetch whichever exist at the root in parallel.
+_OVERVIEW_KEY_FILES = (
+    "README.md",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "Cargo.toml",
+    "justfile",
+    "Dockerfile",
+)
+
+
+@mcp.tool()
+async def repo_overview(repo: str, ref: str = "main") -> dict:
+    """One-shot orientation for a platform app's repo. CALL THIS FIRST when
+    you're starting work on a repo you haven't seen — it returns the full
+    file tree plus README and common manifest files (package.json,
+    pyproject.toml, go.mod, justfile, Dockerfile if they exist) in a single
+    network round-trip. Saves you 10+ list_files / read_file calls.
+
+    Use `list_files` and `read_file` for targeted lookups after this.
+    Blocked paths (`.github/`, `deploy/`) are filtered from the tree.
+    """
+    gh, _ = _current_user()
+
+    tree = await gh.get_tree(OWNER, repo, ref, recursive=True)
+
+    entries = [
+        {
+            "path": e["path"],
+            "type": e["type"],
+            "size": e.get("size"),
+        }
+        for e in tree.get("tree", [])
+        if not _is_blocked_path(e.get("path") or "")
+    ]
+
+    # Find which of the well-known manifest files exist at the repo root.
+    root_blobs = {
+        e["path"] for e in entries
+        if e["type"] == "blob" and "/" not in e["path"]
+    }
+    to_fetch = [name for name in _OVERVIEW_KEY_FILES if name in root_blobs]
+
+    async def _fetch_one(path: str) -> tuple[str, str | None]:
+        try:
+            data = await gh.get_contents(OWNER, repo, path, ref=ref)
+            if isinstance(data, dict):
+                return path, decode_file_content(data)
+        except Exception:
+            pass
+        return path, None
+
+    results = await asyncio.gather(*(_fetch_one(p) for p in to_fetch))
+    key_files = {p: c for p, c in results if c is not None}
+
+    return {
+        "repo": f"{OWNER}/{repo}",
+        "ref": ref,
+        "tree": entries,
+        "truncated": tree.get("truncated", False),
+        "key_files": key_files,
+    }
+
+
+@mcp.tool()
+async def read_files(
+    repo: str, paths: list[str], ref: str | None = None
+) -> dict:
+    """Read multiple files from a platform app's repo in parallel. Use this
+    instead of multiple `read_file` calls — one chat-client→MCP round-trip
+    instead of N, and the GitHub fetches happen concurrently.
+
+    Refuses any path under `.github/` or `deploy/`.
+    """
+    for p in paths:
+        _ensure_not_blocked(p)
+    gh, _ = _current_user()
+
+    async def _fetch_one(path: str) -> tuple[str, dict]:
+        try:
+            data = await gh.get_contents(OWNER, repo, path, ref)
+            if isinstance(data, dict):
+                content = decode_file_content(data)
+                return path, {
+                    "content": content,
+                    "sha": data.get("sha"),
+                    "size": data.get("size"),
+                    "encoding": "utf-8" if content is not None else data.get("encoding"),
+                }
+            return path, {"error": "path is a directory, not a file"}
+        except httpx.HTTPStatusError as e:
+            return path, {"error": f"HTTP {e.response.status_code}"}
+        except Exception as e:
+            return path, {"error": str(e)}
+
+    results = await asyncio.gather(*(_fetch_one(p) for p in paths))
+    return {"files": dict(results)}
 
 
 @mcp.tool()

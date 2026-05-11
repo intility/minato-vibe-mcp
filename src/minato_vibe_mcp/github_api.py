@@ -74,6 +74,21 @@ class GitHubClient:
         r.raise_for_status()
         return r.json()
 
+    async def get_tree(
+        self, owner: str, repo: str, tree_ish: str = "main", recursive: bool = True
+    ) -> dict[str, Any]:
+        """Get a git tree. `tree_ish` can be a branch name or tree SHA.
+        With recursive=True, returns the entire tree in one call (may be
+        truncated if the repo is very large; `truncated` field signals)."""
+        params = {"recursive": "1"} if recursive else None
+        r = await self._http.get(
+            f"{API_BASE}/repos/{owner}/{repo}/git/trees/{tree_ish}",
+            headers=self._headers,
+            params=params,
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def get_ref(self, owner: str, repo: str, ref: str) -> dict[str, Any]:
         """Get a git ref (e.g. `heads/main`). Returns object with `.object.sha`."""
         r = await self._http.get(
