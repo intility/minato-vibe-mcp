@@ -17,6 +17,15 @@ Each user authenticates with their own GitHub personal access token, which doubl
 | `confirm_write(token)` | Commits a write previously staged by `write_file`. Single-use, expires 5 min, scoped to the user. |
 | `list_pending_writes` | Shows the user's own pending writes. |
 
+## Platform-managed paths are off-limits
+
+`read_file`, `list_files`, `write_file`, and `confirm_write` all refuse paths under:
+
+- `.github/` — CI workflows, dependabot, CODEOWNERS. A malicious workflow could exfiltrate secrets on next build.
+- `deploy/` — Kubernetes manifests. A malicious NetworkPolicy or RBAC change could escalate privileges or expose internals.
+
+`list_files` filters these out of root listings too, so the model doesn't even see they exist. Edit these through a normal PR with human review if you need to.
+
 ## Writes are two-step
 
 To protect against prompt injection (the [lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/)), the MCP never lets the model commit in a single step:

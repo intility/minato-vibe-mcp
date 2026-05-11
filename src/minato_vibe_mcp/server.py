@@ -21,7 +21,40 @@ PLATFORM_REPO = "minato-vibe"
 APP_URL_BASE = os.environ.get("MINATO_VIBE_APP_URL_BASE", "vibe.intility.dev")
 PENDING_WRITE_TTL_SECONDS = 300
 
+# Path prefixes the MCP refuses to read, write, or list. These are
+# platform-managed (CI workflows, k8s manifests) — vibecoding them would
+# let a prompt-injected model escalate to secret exfiltration via CI,
+# privilege changes via RBAC, or break the deploy loop. Edit them through
+# a normal PR with human review.
+BLOCKED_PATH_PREFIXES = (".github", "deploy")
+
 DNS_1123 = re.compile(r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
+
+
+def _normalize_path(path: str) -> str:
+    p = path.strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/").lower()
+
+
+def _is_blocked_path(path: str) -> bool:
+    p = _normalize_path(path)
+    for prefix in BLOCKED_PATH_PREFIXES:
+        if p == prefix or p.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def _ensure_not_blocked(path: str) -> None:
+    if _is_blocked_path(path):
+        raise PermissionError(
+            f"path '{path}' is in the platform-managed area "
+            f"({', '.join(BLOCKED_PATH_PREFIXES)}/). The MCP refuses to "
+            "read, write, or list these — they affect CI, deployment, and "
+            "security boundaries and shouldn't be vibe-coded. Edit them "
+            "through a normal PR if you really need to."
+        )
 
 
 # Module-level httpx client. The streamable-http transport's auth path runs
@@ -212,7 +245,12 @@ async def create_app(
 
 @mcp.tool()
 async def read_file(repo: str, path: str, ref: str | None = None) -> dict:
-    """Read a file from a platform app's repo (under intility/)."""
+    """Read a file from a platform app's repo (under intility/).
+
+    The MCP refuses paths under `.github/` and `deploy/` — those are
+    platform-managed (CI, k8s manifests) and not vibe-codable.
+    """
+    _ensure_not_blocked(path)
     gh, _ = _current_user()
     data = await gh.get_contents(OWNER, repo, path, ref)
     if isinstance(data, dict):
@@ -231,7 +269,14 @@ async def read_file(repo: str, path: str, ref: str | None = None) -> dict:
 
 @mcp.tool()
 async def list_files(repo: str, path: str = "", ref: str | None = None) -> dict:
-    """List files in a directory of a platform app's repo (under intility/)."""
+    """List files in a directory of a platform app's repo (under intility/).
+
+    The MCP refuses to list inside `.github/` or `deploy/`, and filters
+    those entries out of root listings — they're platform-managed and
+    intentionally hidden from vibe-coding.
+    """
+    if path:
+        _ensure_not_blocked(path)
     gh, _ = _current_user()
     data = await gh.get_contents(OWNER, repo, path, ref)
     if isinstance(data, list):
@@ -245,6 +290,7 @@ async def list_files(repo: str, path: str = "", ref: str | None = None) -> dict:
                     "sha": e.get("sha"),
                 }
                 for e in data
+                if not _is_blocked_path(e.get("path") or "")
             ]
         }
     return {"raw": data}
@@ -267,7 +313,11 @@ async def write_file(
 
     The token is single-use, valid for 5 minutes, and scoped to the
     authenticated user. Writes to `main` trigger the platform deploy loop.
+
+    Paths under `.github/` and `deploy/` are refused — those are
+    platform-managed (CI, k8s) and not vibe-codable.
     """
+    _ensure_not_blocked(path)
     _gc_pending_writes()
     gh, login = _current_user()
 
@@ -327,6 +377,9 @@ async def confirm_write(token: str) -> dict:
             "Unknown or expired confirmation token. Call write_file again "
             "to stage the change and get a fresh token."
         )
+    # Defense-in-depth: re-check the path on confirm even though write_file
+    # already rejected blocked paths.
+    _ensure_not_blocked(pending.path)
 
     result = await gh.put_contents(
         owner=OWNER,
