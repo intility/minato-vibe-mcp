@@ -32,11 +32,33 @@ To protect against prompt injection (the [lethal trifecta](https://simonwillison
 
 1. Model calls `write_file(...)` → MCP returns a diff and a confirmation token.
 2. Chat client shows the diff to **you, the human**.
-3. You approve. Model calls `confirm_write(token)` → MCP commits.
+3. You approve. Model calls `confirm_write(token)` → MCP lands the change.
 
 The token is single-use, expires after 5 minutes, lives only in MCP memory, and is scoped to the authenticated user (another user's token can't confirm your pending writes).
 
 This is defense-in-depth, not magic. If you reflexively approve every diff, the protection collapses. Read the diff.
+
+### What `confirm_write` does on a protected branch
+
+Direct pushes to `main` (and `master`/`trunk`) are blocked by the platform's org-level ruleset, so `confirm_write` takes the PR path:
+
+1. Creates a `vibe/<timestamp>-<random>` branch from the target branch's HEAD.
+2. Commits the file there with the user's message as the commit subject.
+3. Opens a PR with the same title, body cites the authenticating user.
+4. Tries a direct squash-merge. If org rules block it (required checks, reviews), enables auto-merge instead so it lands when gates pass.
+
+After merge, release-please opens a release PR for `feat:`/`fix:` commits and auto-merges it; `build-image` fires on the tag, opens an auto-merging pin PR, and Argo CD reconciles. End-to-end push-to-live is a few minutes (vs. the old ~50s push-to-main flow).
+
+For non-protected branches (anything not in `{main, master, trunk}`), `confirm_write` commits directly — no PR.
+
+### PAT permissions
+
+Fine-grained PAT needs:
+
+- Contents: read & write
+- Metadata: read
+- Pull requests: read & write *(new in 0.4 — needed for the branch+PR flow)*
+- Administration: write *(only if you'll use `create_app` to generate repos from templates)*
 
 ## How a user authenticates
 

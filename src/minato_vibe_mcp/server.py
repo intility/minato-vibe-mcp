@@ -359,6 +359,12 @@ async def write_file(
     }
 
 
+# Branches that have org-level branch protection (no direct push, PR required).
+# Writes targeting these go through a vibe/<id> branch + auto-merging PR; writes
+# to other branches commit directly.
+PROTECTED_BRANCHES = frozenset({"main", "master", "trunk"})
+
+
 @mcp.tool()
 async def confirm_write(token: str) -> dict:
     """STEP 2 OF 2: commit a write previously staged by `write_file`.
@@ -366,6 +372,14 @@ async def confirm_write(token: str) -> dict:
     Only call after the user has seen the diff and explicitly approved.
     Single-use; expires 5 minutes after staging; scoped to the authenticated
     user (you can't confirm another user's pending writes).
+
+    Writes targeting a protected branch (main/master/trunk) take the
+    PR-based path required by the platform's stricter deploy model:
+    commit lands on a vibe/<id> branch, a PR is opened with the user's
+    message as title, and the MCP tries to squash-merge it. If org rules
+    block the direct merge (required checks, reviews, etc.), the MCP
+    enables auto-merge so it lands as soon as gates pass. End-to-end
+    push-to-live is a few minutes (release-please + pin PR cycle).
     """
     _gc_pending_writes()
     gh, login = _current_user()
@@ -377,27 +391,89 @@ async def confirm_write(token: str) -> dict:
             "Unknown or expired confirmation token. Call write_file again "
             "to stage the change and get a fresh token."
         )
-    # Defense-in-depth: re-check the path on confirm even though write_file
-    # already rejected blocked paths.
     _ensure_not_blocked(pending.path)
 
-    result = await gh.put_contents(
+    if pending.branch not in PROTECTED_BRANCHES:
+        # Unprotected branch — direct commit.
+        result = await gh.put_contents(
+            owner=OWNER,
+            repo=pending.repo,
+            path=pending.path,
+            content=pending.content,
+            message=pending.message,
+            branch=pending.branch,
+            sha=pending.sha,
+        )
+        return {
+            "status": "committed",
+            "target": f"{OWNER}/{pending.repo}@{pending.branch}:{pending.path}",
+            "commit": {
+                "sha": (result.get("commit") or {}).get("sha"),
+                "html_url": (result.get("commit") or {}).get("html_url"),
+            },
+            "content_sha": (result.get("content") or {}).get("sha"),
+        }
+
+    # Protected branch — branch + commit + PR + merge dance.
+    base_ref = await gh.get_ref(OWNER, pending.repo, f"heads/{pending.branch}")
+    base_sha = base_ref["object"]["sha"]
+
+    branch_name = f"vibe/{int(time.time())}-{secrets.token_hex(3)}"
+    await gh.create_ref(
+        OWNER, pending.repo, f"refs/heads/{branch_name}", base_sha
+    )
+
+    commit_result = await gh.put_contents(
         owner=OWNER,
         repo=pending.repo,
         path=pending.path,
         content=pending.content,
         message=pending.message,
-        branch=pending.branch,
+        branch=branch_name,
         sha=pending.sha,
     )
+
+    pr = await gh.create_pull_request(
+        owner=OWNER,
+        repo=pending.repo,
+        head=branch_name,
+        base=pending.branch,
+        title=pending.message,
+        body=(
+            f"Vibe-coded via minato-vibe-mcp.\n\n"
+            f"Approved by @{login} via `confirm_write`. "
+            f"File: `{pending.path}`."
+        ),
+    )
+
+    # Try direct squash merge. If org rules block it (required checks etc.),
+    # fall back to enabling auto-merge so it lands when gates pass.
+    merge_status, _ = await gh.merge_pull_request(
+        OWNER, pending.repo, pr["number"], "squash"
+    )
+    merge_state: str
+    if merge_status == 200:
+        merge_state = "merged"
+    else:
+        try:
+            await gh.enable_auto_merge(pr["node_id"], "SQUASH")
+            merge_state = "auto_merge_enabled"
+        except Exception:
+            merge_state = "pr_open_needs_manual_merge"
+
     return {
-        "status": "committed",
+        "status": merge_state,
         "target": f"{OWNER}/{pending.repo}@{pending.branch}:{pending.path}",
-        "commit": {
-            "sha": (result.get("commit") or {}).get("sha"),
-            "html_url": (result.get("commit") or {}).get("html_url"),
-        },
-        "content_sha": (result.get("content") or {}).get("sha"),
+        "pr_url": pr["html_url"],
+        "pr_number": pr["number"],
+        "branch": branch_name,
+        "commit_sha": (commit_result.get("commit") or {}).get("sha"),
+        "next": (
+            "release-please will open a release PR for any feat:/fix: "
+            "commits and auto-merge it; build-image then fires on the "
+            "tag, opens an auto-merging pin PR, and Argo CD reconciles. "
+            "Few minutes end-to-end."
+        ),
     }
 
 

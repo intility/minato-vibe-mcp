@@ -74,6 +74,91 @@ class GitHubClient:
         r.raise_for_status()
         return r.json()
 
+    async def get_ref(self, owner: str, repo: str, ref: str) -> dict[str, Any]:
+        """Get a git ref (e.g. `heads/main`). Returns object with `.object.sha`."""
+        r = await self._http.get(
+            f"{API_BASE}/repos/{owner}/{repo}/git/ref/{ref}",
+            headers=self._headers,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def create_ref(
+        self, owner: str, repo: str, ref: str, sha: str
+    ) -> dict[str, Any]:
+        """Create a ref. `ref` must be the full ref name (e.g. `refs/heads/foo`)."""
+        r = await self._http.post(
+            f"{API_BASE}/repos/{owner}/{repo}/git/refs",
+            headers=self._headers,
+            json={"ref": ref, "sha": sha},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def create_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        head: str,
+        base: str,
+        title: str,
+        body: str = "",
+    ) -> dict[str, Any]:
+        r = await self._http.post(
+            f"{API_BASE}/repos/{owner}/{repo}/pulls",
+            headers=self._headers,
+            json={"head": head, "base": base, "title": title, "body": body},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def merge_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        merge_method: str = "squash",
+    ) -> tuple[int, dict[str, Any] | None]:
+        """Returns (status_code, body). Does NOT raise on 4xx; caller decides."""
+        r = await self._http.put(
+            f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}/merge",
+            headers=self._headers,
+            json={"merge_method": merge_method},
+        )
+        body = None
+        if r.content:
+            try:
+                body = r.json()
+            except ValueError:
+                pass
+        return r.status_code, body
+
+    async def enable_auto_merge(
+        self, pr_node_id: str, merge_method: str = "SQUASH"
+    ) -> dict[str, Any]:
+        """Enable auto-merge via GraphQL. `pr_node_id` is the GraphQL node ID
+        from the PR create response (`node_id` field)."""
+        query = (
+            "mutation($prId: ID!, $method: PullRequestMergeMethod!) {"
+            "  enablePullRequestAutoMerge("
+            "    input: {pullRequestId: $prId, mergeMethod: $method}"
+            "  ) { pullRequest { number } }"
+            "}"
+        )
+        r = await self._http.post(
+            "https://api.github.com/graphql",
+            headers=self._headers,
+            json={
+                "query": query,
+                "variables": {"prId": pr_node_id, "method": merge_method},
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        if "errors" in data:
+            raise RuntimeError(f"GraphQL errors: {data['errors']}")
+        return data
+
     async def generate_from_template(
         self,
         template_owner: str,
