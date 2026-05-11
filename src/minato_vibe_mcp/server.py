@@ -138,12 +138,18 @@ def _current_user() -> tuple[GitHubClient, str]:
     return GitHubClient(access.token, _HTTP), access.client_id
 
 
-def _resource_url() -> str:
-    """The public URL of this MCP server, used as the OAuth resource id.
-    Override with MINATO_VIBE_MCP_URL when running behind a different hostname."""
+def _base_url() -> str:
+    """The public base URL of this MCP. Hosts /.well-known endpoints and
+    /authorize, /token, /register. Override with MINATO_VIBE_MCP_URL."""
     return os.environ.get(
         "MINATO_VIBE_MCP_URL", "http://localhost:8000"
-    )
+    ).rstrip("/")
+
+
+def _mcp_resource_url() -> str:
+    """The canonical URI of the MCP HTTP endpoint itself — what the chat
+    client uses as the OAuth resource indicator. MUST end in /mcp."""
+    return f"{_base_url()}/mcp"
 
 
 # OAuth wiring. If GITHUB_OAUTH_CLIENT_ID/SECRET are set, the MCP runs as a
@@ -152,12 +158,12 @@ def _resource_url() -> str:
 # back to the simpler "user pastes a GitHub PAT as Bearer token" path. Either
 # way, OAuth-issued MCP tokens AND raw GitHub PATs both work end-to-end —
 # tokens are routed through one provider that handles both shapes.
-_OAUTH_PROVIDER = build_oauth_provider(_HTTP, _resource_url())
+_OAUTH_PROVIDER = build_oauth_provider(_HTTP, _base_url())
 
 if _OAUTH_PROVIDER is not None:
     _AUTH_SETTINGS = AuthSettings(
-        issuer_url=_resource_url(),  # type: ignore[arg-type]
-        resource_server_url=_resource_url(),  # type: ignore[arg-type]
+        issuer_url=_base_url(),  # type: ignore[arg-type]
+        resource_server_url=_mcp_resource_url(),  # type: ignore[arg-type]
         client_registration_options=ClientRegistrationOptions(
             enabled=True,
             valid_scopes=["repo", "read:org"],
@@ -172,8 +178,8 @@ else:
     _MCP_AUTH_KWARGS = {
         "token_verifier": GitHubPATVerifier(_HTTP),
         "auth": AuthSettings(
-            issuer_url=_resource_url(),  # type: ignore[arg-type]
-            resource_server_url=_resource_url(),  # type: ignore[arg-type]
+            issuer_url=_base_url(),  # type: ignore[arg-type]
+            resource_server_url=_mcp_resource_url(),  # type: ignore[arg-type]
         ),
     }
 
