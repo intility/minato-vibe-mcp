@@ -152,15 +152,22 @@ mcp: FastMCP = FastMCP(
         "`read_files(repo, paths)` to fetch them in parallel — not a loop "
         "of read_file calls.\n\n"
         "CREATION — `list_templates` + `create_app` to scaffold a new app.\n\n"
-        "EDITING — `write_file` then `confirm_write` to land a change. "
+        "EDITING — stage each change with `write_file`, then commit. "
+        "For a SINGLE file: `confirm_write(token)`. For MULTIPLE files "
+        "that belong to ONE logical change (a feature, a refactor): stage "
+        "each with `write_file`, then land them all in ONE PR with "
+        "`confirm_writes([token1, token2, ...], message)`. Each "
+        "`confirm_write` opens a separate PR which triggers a separate "
+        "release-please + build + deploy cycle — batch when you can.\n\n"
         "Writes to `main` go through a PR that auto-merges; "
         "release-please then drives the release + build + deploy. End to "
         "end push-to-live is a few minutes.\n\n"
         "WRITES ARE TWO-STEP: `write_file` stages a change and returns a "
         "diff + confirmation token but does NOT commit. The human must "
-        "approve, then `confirm_write(token)` commits. Always show the diff "
-        "and wait for explicit user approval. This is the security boundary "
-        "that protects against prompt injection."
+        "approve, then `confirm_write` or `confirm_writes` commits. "
+        "Always show diffs and wait for explicit user approval before "
+        "confirming. This is the security boundary that protects against "
+        "prompt injection."
     ),
     token_verifier=_VERIFIER,
     auth=AuthSettings(
@@ -584,6 +591,155 @@ async def confirm_write(token: str) -> dict:
             "tag, opens an auto-merging pin PR, and Argo CD reconciles. "
             "Few minutes end-to-end."
         ),
+    }
+
+
+@mcp.tool()
+async def confirm_writes(
+    tokens: list[str], message: str | None = None
+) -> dict:
+    """STEP 2 OF 2 (BATCH): land MULTIPLE staged writes in a SINGLE PR.
+
+    Use this instead of calling `confirm_write` once per file when several
+    `write_file` stagings belong to the same logical change. The platform's
+    deploy model means each PR triggers a release-please cycle and a build;
+    consolidating N file changes into one PR saves N-1 of those cycles.
+
+    All tokens must:
+      - Belong to the authenticated user
+      - Target the same repo and the same branch
+      - Be unexpired
+
+    On a protected branch (main/master/trunk), the batch lands as one PR
+    (one commit per file, squash-merged). On other branches, each file is
+    committed directly to the target branch in sequence (no PR).
+
+    `message`: PR/commit title. If omitted, the first staged write's
+    message is used.
+    """
+    if not tokens:
+        raise ValueError("tokens must not be empty")
+
+    _gc_pending_writes()
+    gh, login = _current_user()
+    user_pending = _pending_writes.get(login, {})
+
+    # Resolve tokens but don't pop yet — we want to fail atomically if any
+    # token is invalid, leaving the rest staged.
+    pendings: list = []
+    for t in tokens:
+        p = user_pending.get(t)
+        if p is None:
+            raise ValueError(
+                f"Unknown or expired confirmation token: {t!r}. "
+                "Re-stage with write_file."
+            )
+        pendings.append((t, p))
+
+    # All-same-repo + all-same-branch invariant
+    repo = pendings[0][1].repo
+    branch = pendings[0][1].branch
+    for _, p in pendings[1:]:
+        if p.repo != repo:
+            raise ValueError(
+                f"All tokens must target the same repo. Got {repo} and {p.repo}."
+            )
+        if p.branch != branch:
+            raise ValueError(
+                f"All tokens must target the same branch. Got {branch} and {p.branch}."
+            )
+    for _, p in pendings:
+        _ensure_not_blocked(p.path)
+
+    title = message or pendings[0][1].message
+
+    if branch not in PROTECTED_BRANCHES:
+        # Direct commit each file to the target branch. No PR.
+        commits = []
+        for _, p in pendings:
+            result = await gh.put_contents(
+                owner=OWNER,
+                repo=p.repo,
+                path=p.path,
+                content=p.content,
+                message=p.message,
+                branch=p.branch,
+                sha=p.sha,
+            )
+            commits.append({
+                "path": p.path,
+                "sha": (result.get("commit") or {}).get("sha"),
+            })
+        # Only pop on success.
+        for t, _ in pendings:
+            user_pending.pop(t, None)
+        return {
+            "status": "committed",
+            "target": f"{OWNER}/{repo}@{branch}",
+            "commits": commits,
+        }
+
+    # Protected branch: one branch, N commits, one PR.
+    base_ref = await gh.get_ref(OWNER, repo, f"heads/{branch}")
+    base_sha = base_ref["object"]["sha"]
+    branch_name = f"vibe/{int(time.time())}-{secrets.token_hex(3)}"
+    await gh.create_ref(OWNER, repo, f"refs/heads/{branch_name}", base_sha)
+
+    commits = []
+    for _, p in pendings:
+        result = await gh.put_contents(
+            owner=OWNER,
+            repo=repo,
+            path=p.path,
+            content=p.content,
+            message=p.message,
+            branch=branch_name,
+            sha=p.sha,
+        )
+        commits.append({
+            "path": p.path,
+            "sha": (result.get("commit") or {}).get("sha"),
+        })
+
+    paths_listed = "\n".join(f"- `{p.path}`" for _, p in pendings)
+    pr = await gh.create_pull_request(
+        owner=OWNER,
+        repo=repo,
+        head=branch_name,
+        base=branch,
+        title=title,
+        body=(
+            f"Vibe-coded via minato-vibe-mcp.\n\n"
+            f"Approved by @{login} via `confirm_writes`.\n\n"
+            f"Files in this PR ({len(pendings)}):\n{paths_listed}"
+        ),
+    )
+
+    merge_status, _ = await gh.merge_pull_request(
+        OWNER, repo, pr["number"], "squash"
+    )
+    merge_state: str
+    if merge_status == 200:
+        merge_state = "merged"
+    else:
+        try:
+            await gh.enable_auto_merge(pr["node_id"], "SQUASH")
+            merge_state = "auto_merge_enabled"
+        except Exception:
+            merge_state = "pr_open_needs_manual_merge"
+
+    # Only pop on success.
+    for t, _ in pendings:
+        user_pending.pop(t, None)
+
+    return {
+        "status": merge_state,
+        "target": f"{OWNER}/{repo}@{branch}",
+        "pr_url": pr["html_url"],
+        "pr_number": pr["number"],
+        "branch": branch_name,
+        "commits": commits,
+        "files_changed": len(pendings),
     }
 
 

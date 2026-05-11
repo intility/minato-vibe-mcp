@@ -16,7 +16,8 @@ Each user authenticates with their own GitHub personal access token, which doubl
 | `read_files(repo, paths, ref?)` | Reads several files in parallel — one round-trip instead of N. |
 | `list_files(repo, path?, ref?)` | Lists a directory in `intility/<repo>`. |
 | `write_file(repo, path, content, message, branch?)` | **Stages** a write. Returns a unified diff + confirmation token. Does NOT commit. |
-| `confirm_write(token)` | Commits a write previously staged by `write_file`. Single-use, expires 5 min, scoped to the user. |
+| `confirm_write(token)` | Commits a single staged write — opens its own PR. |
+| `confirm_writes(tokens, message?)` | **Batch**: land multiple staged writes in ONE PR. Use this when several files belong to the same logical change (a feature, a refactor) so you trigger one release-please + build cycle instead of N. |
 | `list_pending_writes` | Shows the user's own pending writes. |
 
 ## Platform-managed paths are off-limits
