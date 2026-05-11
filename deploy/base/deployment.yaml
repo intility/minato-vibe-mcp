@@ -34,6 +34,22 @@ spec:
             # __APP_NAME__.vibe.intility.dev.
             - name: MINATO_VIBE_APP_URL_BASE
               value: vibe.intility.dev
+            # GitHub OAuth App credentials. When both are set, the MCP runs
+            # as a full OAuth 2.1 Authorization Server with GitHub as the
+            # upstream IdP (chat clients get a login popup). When unset, the
+            # MCP falls back to "user pastes a GitHub PAT" Bearer auth.
+            - name: GITHUB_OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minato-vibe-mcp-oauth
+                  key: client_id
+                  optional: true
+            - name: GITHUB_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: minato-vibe-mcp-oauth
+                  key: client_secret
+                  optional: true
           resources:
             requests:
               cpu: 50m

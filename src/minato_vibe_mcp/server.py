@@ -10,13 +10,16 @@ from dataclasses import dataclass
 
 import httpx
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from .auth import GitHubPATVerifier
 from .catalog import TEMPLATES, get_template
 from .conventions import CONVENTIONS, get_conventions, list_template_names
 from .github_api import GitHubClient, decode_file_content
+from .oauth import build_oauth_provider
 from .validation import validate_content
 
 OWNER = "intility"
@@ -115,13 +118,23 @@ def _make_diff(before: str | None, after: str, path: str) -> str:
 
 def _current_user() -> tuple[GitHubClient, str]:
     """Resolve the authenticated user from the request context. Returns
-    (GitHub API client bound to their token, GitHub login)."""
+    (GitHub API client bound to their upstream GitHub token, GitHub login).
+
+    Handles both shapes: OAuth-issued MCP tokens (where access.token is OUR
+    token and we look up the upstream GitHub token internally) and raw PATs
+    (where access.token IS the GitHub token)."""
     access = get_access_token()
     if access is None:
         raise PermissionError(
-            "Not authenticated. The MCP requires a GitHub personal access "
-            "token as a Bearer token."
+            "Not authenticated. Connect via OAuth or pass a GitHub PAT as "
+            "the Bearer token."
         )
+    if _OAUTH_PROVIDER is not None:
+        upstream = _OAUTH_PROVIDER.lookup_github_token(access.token)
+        if upstream is not None:
+            gh_token, login = upstream
+            return GitHubClient(gh_token, _HTTP), login
+    # PAT fallback: the bearer IS the GitHub token.
     return GitHubClient(access.token, _HTTP), access.client_id
 
 
@@ -133,10 +146,36 @@ def _resource_url() -> str:
     )
 
 
-# The verifier needs the http client; we construct it after lifespan starts.
-# FastMCP requires the verifier at construction time, so we use a thin
-# indirection that picks up the shared client lazily.
-_VERIFIER = GitHubPATVerifier(_HTTP)
+# OAuth wiring. If GITHUB_OAUTH_CLIENT_ID/SECRET are set, the MCP runs as a
+# full OAuth 2.1 Authorization Server with GitHub as the upstream IdP — chat
+# clients use the standard login popup. If those env vars are unset, we fall
+# back to the simpler "user pastes a GitHub PAT as Bearer token" path. Either
+# way, OAuth-issued MCP tokens AND raw GitHub PATs both work end-to-end —
+# tokens are routed through one provider that handles both shapes.
+_OAUTH_PROVIDER = build_oauth_provider(_HTTP, _resource_url())
+
+if _OAUTH_PROVIDER is not None:
+    _AUTH_SETTINGS = AuthSettings(
+        issuer_url=_resource_url(),  # type: ignore[arg-type]
+        resource_server_url=_resource_url(),  # type: ignore[arg-type]
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,
+            valid_scopes=["repo", "read:org"],
+            default_scopes=["repo", "read:org"],
+        ),
+    )
+    _MCP_AUTH_KWARGS: dict = {
+        "auth_server_provider": _OAUTH_PROVIDER,
+        "auth": _AUTH_SETTINGS,
+    }
+else:
+    _MCP_AUTH_KWARGS = {
+        "token_verifier": GitHubPATVerifier(_HTTP),
+        "auth": AuthSettings(
+            issuer_url=_resource_url(),  # type: ignore[arg-type]
+            resource_server_url=_resource_url(),  # type: ignore[arg-type]
+        ),
+    }
 
 
 mcp: FastMCP = FastMCP(
@@ -178,15 +217,44 @@ mcp: FastMCP = FastMCP(
         "confirming. This is the security boundary that protects against "
         "prompt injection."
     ),
-    token_verifier=_VERIFIER,
-    auth=AuthSettings(
-        issuer_url=_resource_url(),  # type: ignore[arg-type]
-        resource_server_url=_resource_url(),  # type: ignore[arg-type]
-    ),
     host=os.environ.get("MINATO_VIBE_MCP_HOST", "0.0.0.0"),
     port=int(os.environ.get("MINATO_VIBE_MCP_PORT", "8000")),
     stateless_http=True,
+    **_MCP_AUTH_KWARGS,
 )
+
+
+# GitHub OAuth return URL. GitHub redirects here with `?code=...&state=...`
+# after the user authorizes. We swap the GitHub code for a GitHub token,
+# mint our own auth code, and redirect the user back to the chat client's
+# redirect_uri. Only registered when the OAuth provider is configured.
+if _OAUTH_PROVIDER is not None:
+
+    @mcp.custom_route("/oauth/callback", methods=["GET"])
+    async def github_callback(request: Request) -> Response:
+        code = request.query_params.get("code")
+        state = request.query_params.get("state")
+        error = request.query_params.get("error")
+        if error:
+            return HTMLResponse(
+                f"<h1>GitHub authorization failed</h1><p>{error}</p>",
+                status_code=400,
+            )
+        if not code or not state:
+            return HTMLResponse(
+                "<h1>Missing code or state</h1>",
+                status_code=400,
+            )
+        try:
+            redirect_url = await _OAUTH_PROVIDER.handle_github_callback(
+                code=code, state=state
+            )
+        except Exception as e:
+            return HTMLResponse(
+                f"<h1>Authorization callback failed</h1><pre>{e}</pre>",
+                status_code=400,
+            )
+        return RedirectResponse(redirect_url, status_code=302)
 
 
 def _validate_name(name: str) -> None:

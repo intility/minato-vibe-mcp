@@ -69,13 +69,16 @@ Fine-grained PAT needs:
 
 ## How a user authenticates
 
-1. Create a **fine-grained PAT** at <https://github.com/settings/tokens?type=beta>:
-   - Resource owner: `intility`
-   - Repository access: pick the repos you want the MCP to touch (or "All repositories" if you want new apps you create to be auto-included).
-   - Repository permissions: **Contents: read & write**, **Metadata: read**, **Administration: write** (the last is needed to create new repos from templates).
-2. Paste the token into your chat client as the Bearer credential for this MCP.
+**Recommended: GitHub OAuth (login popup).** When the MCP is deployed with an OAuth App configured, every major chat client (Claude Desktop, Claude.ai, ChatGPT, Claude Code) will detect the OAuth flow on first connect: a browser tab opens to GitHub's "Authorize" page, you click Authorize, and the chat client now has a token. No PAT management. Revocation via <https://github.com/settings/applications>.
 
-GitHub's own scoping is the outer lock: even if the model is fully prompt-injected, it cannot reach repos outside what you ticked.
+**Fallback: fine-grained PAT.** Works even when OAuth isn't set up. Create one at <https://github.com/settings/tokens?type=beta>:
+- Resource owner: `intility`
+- Repository access: pick the repos you want the MCP to touch (or "All repositories")
+- Permissions: **Contents** + **Pull requests** read & write, **Metadata** read, **Administration** write (for `create_app`)
+
+Then paste it into your chat client as the Bearer credential. Both paths work simultaneously: OAuth-issued MCP tokens AND raw GitHub PATs route through the same verifier.
+
+GitHub's own scoping is the outer lock for either path: the MCP cannot reach repos outside what you authorized (OAuth scopes) or ticked (fine-grained PAT).
 
 ## Configure in a chat client
 
