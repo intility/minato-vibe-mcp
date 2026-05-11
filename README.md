@@ -11,14 +11,18 @@ Each user authenticates with their own GitHub personal access token, which doubl
 | `whoami` | Returns the GitHub identity of the authenticated user. |
 | `list_templates` | Returns the two golden-path templates (`react-vibe-template`, `react-go-template`). |
 | `create_app(name, template?, description?)` | Creates `intility/<name>` from the chosen template **as a private repo**, running as the authenticated user. The MCP never creates public repos. |
-| `repo_overview(repo, ref?)` | **Call this first when starting work on a repo.** One round-trip returns the full file tree + README + common manifests (package.json, pyproject.toml, go.mod, justfile, Dockerfile). Replaces 10+ exploration calls. |
-| `read_file(repo, path, ref?)` | Reads a single file from `intility/<repo>`. For multiple files, prefer `read_files`. |
-| `read_files(repo, paths, ref?)` | Reads several files in parallel — one round-trip instead of N. |
-| `list_files(repo, path?, ref?)` | Lists a directory in `intility/<repo>`. |
-| `write_file(repo, path, content, message, branch?)` | **Stages** a write. Returns a unified diff + confirmation token. Does NOT commit. |
+| `repo_overview(repo, ref?)` | **Call first when starting work on a repo.** One round-trip returns the file tree + README + manifests. Replaces 10+ exploration calls. |
+| `get_template_conventions(template)` | **Call before writing significant code.** Returns the template's non-obvious lint rules and common pitfalls (strict-mode TS, Biome rules, React compiler rules, Go stdlib-only). Pre-empts most first-round CI failures. |
+| `read_file(repo, path, ref?)` | Single file read. For multiple files, prefer `read_files`. |
+| `read_files(repo, paths, ref?)` | Multi-file read in parallel — one round-trip instead of N. |
+| `list_files(repo, path?, ref?)` | List a directory. |
+| `write_file(repo, path, content, message, branch?)` | **Stages** a write. Runs cheap static checks (no-op detection, JSON/YAML/TOML/Python syntax). Returns a diff + confirmation token; does NOT commit. |
 | `confirm_write(token)` | Commits a single staged write — opens its own PR. |
-| `confirm_writes(tokens, message?)` | **Batch**: land multiple staged writes in ONE PR. Use this when several files belong to the same logical change (a feature, a refactor) so you trigger one release-please + build cycle instead of N. |
-| `list_pending_writes` | Shows the user's own pending writes. |
+| `confirm_writes(tokens, message?)` | **Batch**: land multiple staged writes in ONE PR. Use when several files belong to one logical change. |
+| `get_app_status(repo)` | Latest commit, pinned images, latest build run, open release-please PR, drift between main and deployed image — in one call. |
+| `get_build_log(repo, run_id, failed_only?)` | Failed jobs' log tails for a workflow run. Defaults to failed-only. |
+| `dispatch_workflow(repo, workflow?, ref?)` | Trigger `build-image.yml` (or any workflow) via `workflow_dispatch`. Useful when the release-please→build chain misfires. |
+| `list_pending_writes` | The user's pending writes. |
 
 ## Platform-managed paths are off-limits
 

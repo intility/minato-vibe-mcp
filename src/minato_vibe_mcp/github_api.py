@@ -74,6 +74,85 @@ class GitHubClient:
         r.raise_for_status()
         return r.json()
 
+    async def get_branch(
+        self, owner: str, repo: str, branch: str
+    ) -> dict[str, Any]:
+        r = await self._http.get(
+            f"{API_BASE}/repos/{owner}/{repo}/branches/{branch}",
+            headers=self._headers,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def compare_commits(
+        self, owner: str, repo: str, base: str, head: str
+    ) -> dict[str, Any]:
+        r = await self._http.get(
+            f"{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}",
+            headers=self._headers,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def list_pull_requests(
+        self, owner: str, repo: str, state: str = "open"
+    ) -> list[dict[str, Any]]:
+        r = await self._http.get(
+            f"{API_BASE}/repos/{owner}/{repo}/pulls",
+            headers=self._headers,
+            params={"state": state, "per_page": "30"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def list_workflow_runs(
+        self,
+        owner: str,
+        repo: str,
+        workflow_file: str,
+        per_page: int = 5,
+    ) -> dict[str, Any]:
+        """List recent runs of a workflow file (e.g. 'build-image.yml')."""
+        r = await self._http.get(
+            f"{API_BASE}/repos/{owner}/{repo}/actions/workflows/{workflow_file}/runs",
+            headers=self._headers,
+            params={"per_page": str(per_page)},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def list_run_jobs(
+        self, owner: str, repo: str, run_id: int
+    ) -> dict[str, Any]:
+        r = await self._http.get(
+            f"{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs",
+            headers=self._headers,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def get_job_log(self, owner: str, repo: str, job_id: int) -> str:
+        """Returns the full plain-text log for a job. Can be large."""
+        r = await self._http.get(
+            f"{API_BASE}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
+            headers=self._headers,
+            follow_redirects=True,
+        )
+        r.raise_for_status()
+        return r.text
+
+    async def dispatch_workflow(
+        self, owner: str, repo: str, workflow_file: str, ref: str = "main"
+    ) -> None:
+        """Trigger a workflow_dispatch event. Returns nothing on success
+        (GitHub returns 204 No Content)."""
+        r = await self._http.post(
+            f"{API_BASE}/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches",
+            headers=self._headers,
+            json={"ref": ref},
+        )
+        r.raise_for_status()
+
     async def get_tree(
         self, owner: str, repo: str, tree_ish: str = "main", recursive: bool = True
     ) -> dict[str, Any]:

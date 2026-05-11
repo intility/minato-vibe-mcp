@@ -15,7 +15,9 @@ from mcp.server.fastmcp import FastMCP
 
 from .auth import GitHubPATVerifier
 from .catalog import TEMPLATES, get_template
+from .conventions import CONVENTIONS, get_conventions, list_template_names
 from .github_api import GitHubClient, decode_file_content
+from .validation import validate_content
 
 OWNER = "intility"
 PLATFORM_REPO = "minato-vibe"
@@ -146,11 +148,18 @@ mcp: FastMCP = FastMCP(
         "operations run as the authenticated GitHub user.\n\n"
         "EXPLORATION — when starting on a repo, call `repo_overview(repo)` "
         "FIRST. It returns the full file tree plus README and common "
-        "manifests (package.json, pyproject.toml, go.mod, justfile, "
-        "Dockerfile) in a single round-trip. This replaces 10+ "
-        "list_files/read_file calls. For multiple specific files, use "
-        "`read_files(repo, paths)` to fetch them in parallel — not a loop "
-        "of read_file calls.\n\n"
+        "manifests in a single round-trip, replacing 10+ list_files/"
+        "read_file calls. For multiple specific files, use "
+        "`read_files(repo, paths)` to fetch them in parallel. Before "
+        "writing significant code, call `get_template_conventions(template)` "
+        "to learn the project's non-obvious lint rules (strict-mode TS, "
+        "Biome warnings, React compiler rules, Go stdlib-only conventions) "
+        "so the first PR doesn't fail CI.\n\n"
+        "STATUS — `get_app_status(repo)` returns latest commit, pinned "
+        "images, latest build run, open release-please PR, and drift in "
+        "one call. If a build failed, `get_build_log(repo, run_id)` "
+        "returns just the failed jobs' log tails. To force a rebuild, "
+        "`dispatch_workflow(repo)` triggers `build-image.yml`.\n\n"
         "CREATION — `list_templates` + `create_app` to scaffold a new app.\n\n"
         "EDITING — stage each change with `write_file`, then commit. "
         "For a SINGLE file: `confirm_write(token)`. For MULTIPLE files "
@@ -250,11 +259,17 @@ async def create_app(
         "repo_url": f"https://github.com/{OWNER}/{name}",
         "expected_app_url": f"https://{name}.{APP_URL_BASE}",
         "template": template,
+        "first_deploy_eta_minutes": "5-10",
+        "subsequent_deploy_eta_seconds": "~50 (steady-state, once release-please is warm)",
         "next": (
-            f"template-init.yml will run on the new repo, substitute "
-            f"placeholders, and write apps/{name}.yaml back to "
-            f"intility/minato-vibe. The app should be live at "
-            f"https://{name}.{APP_URL_BASE} in ~50 seconds."
+            f"template-init.yml runs on the new repo, substitutes "
+            f"placeholders, writes apps/{name}.yaml back to "
+            f"intility/minato-vibe, and dispatches the first build. "
+            f"First deploy takes 5-10 minutes (template-init + initial "
+            f"release-please cycle + image build + pin PR + Argo CD "
+            f"reconcile). Steady-state deploys after that are ~50s. "
+            f"Use `get_app_status(name='{name}')` to watch progress; "
+            f"final URL: https://{name}.{APP_URL_BASE}."
         ),
     }
 
@@ -449,6 +464,21 @@ async def write_file(
     except httpx.HTTPStatusError as e:
         if e.response.status_code != 404:
             raise
+
+    # Cheap pre-stage validation: no-op detection + JSON/YAML/TOML/Python
+    # syntax. Catches the obvious mistakes without running the real lint
+    # pipeline. Real lint/typecheck still happens in CI.
+    validation_errors = validate_content(path, content, before)
+    if validation_errors:
+        return {
+            "status": "validation_failed",
+            "target": f"{OWNER}/{repo}@{branch}:{path}",
+            "errors": validation_errors,
+            "next": (
+                "Fix the issues above and call write_file again with "
+                "corrected content. Nothing was staged."
+            ),
+        }
 
     diff = _make_diff(before, content, path)
     token = secrets.token_urlsafe(12)
@@ -741,6 +771,235 @@ async def confirm_writes(
         "commits": commits,
         "files_changed": len(pendings),
     }
+
+
+def _parse_kustomization_images(content: str) -> list[dict]:
+    """Pull `images:` entries (name/newName/newTag) from a kustomization.yaml.
+    Cheap line-based parse — avoids a YAML dep for a known-shape file."""
+    images: list[dict] = []
+    cur: dict | None = None
+    in_images = False
+    for raw in content.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("images:"):
+            in_images = True
+            continue
+        if not in_images:
+            continue
+        # End of images: section = a non-indented key
+        if line and not line.startswith((" ", "\t")) and stripped.endswith(":"):
+            break
+        if stripped.startswith("- name:"):
+            if cur:
+                images.append(cur)
+            cur = {"name": stripped.split(":", 1)[1].strip()}
+        elif stripped.startswith("newName:") and cur is not None:
+            cur["newName"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("newTag:") and cur is not None:
+            cur["newTag"] = stripped.split(":", 1)[1].strip()
+    if cur:
+        images.append(cur)
+    return images
+
+
+@mcp.tool()
+async def get_app_status(repo: str) -> dict:
+    """One-shot status of a deployed platform app. Fetches in parallel:
+    latest commit on main, pinned image(s) in deploy/base/kustomization.yaml,
+    latest build-image run, any open release-please PR. Reports drift if the
+    pinned image is behind main.
+
+    Use this instead of poking around with list_files/read_file just to
+    answer "is my change live yet?"
+    """
+    gh, _ = _current_user()
+
+    async def _safe_kust():
+        try:
+            data = await gh.get_contents(
+                OWNER, repo, "deploy/base/kustomization.yaml", ref="main"
+            )
+            return data
+        except Exception:
+            return None
+
+    async def _safe_runs():
+        try:
+            return await gh.list_workflow_runs(
+                OWNER, repo, "build-image.yml", per_page=5
+            )
+        except Exception:
+            return None
+
+    async def _safe_prs():
+        try:
+            return await gh.list_pull_requests(OWNER, repo, state="open")
+        except Exception:
+            return []
+
+    async def _safe_branch():
+        try:
+            return await gh.get_branch(OWNER, repo, "main")
+        except Exception:
+            return None
+
+    branch, kust_data, runs, prs = await asyncio.gather(
+        _safe_branch(), _safe_kust(), _safe_runs(), _safe_prs()
+    )
+
+    latest_sha = (branch or {}).get("commit", {}).get("sha")
+    latest_sha_short = latest_sha[:7] if latest_sha else None
+
+    pinned_images: list[dict] = []
+    if isinstance(kust_data, dict):
+        text = decode_file_content(kust_data) or ""
+        pinned_images = _parse_kustomization_images(text)
+
+    latest_run = None
+    if runs and runs.get("workflow_runs"):
+        r0 = runs["workflow_runs"][0]
+        latest_run = {
+            "id": r0.get("id"),
+            "status": r0.get("status"),
+            "conclusion": r0.get("conclusion"),
+            "head_sha": r0.get("head_sha"),
+            "head_branch": r0.get("head_branch"),
+            "url": r0.get("html_url"),
+            "created_at": r0.get("created_at"),
+        }
+
+    release_pending = False
+    release_pr_url = None
+    for p in prs or []:
+        head_ref = (p.get("head") or {}).get("ref") or ""
+        title = p.get("title") or ""
+        if head_ref.startswith("release-please--") or title.startswith("chore(main): release"):
+            release_pending = True
+            release_pr_url = p.get("html_url")
+            break
+
+    drift = None
+    pinned_short = None
+    for img in pinned_images:
+        tag = img.get("newTag", "")
+        if tag.startswith("sha-"):
+            pinned_short = tag.removeprefix("sha-")
+            break
+    if pinned_short and latest_sha_short and pinned_short != latest_sha_short:
+        try:
+            cmp = await gh.compare_commits(OWNER, repo, pinned_short, latest_sha_short)
+            ahead = cmp.get("ahead_by", 0)
+            drift = f"main is ahead of pinned image by {ahead} commit(s)"
+        except Exception:
+            drift = "pinned image is not at main HEAD"
+
+    return {
+        "repo": f"{OWNER}/{repo}",
+        "expected_url": f"https://{repo}.{APP_URL_BASE}",
+        "latest_main_commit": latest_sha,
+        "pinned_images": pinned_images,
+        "latest_build_run": latest_run,
+        "release_please_pending": release_pending,
+        "release_please_pr_url": release_pr_url,
+        "drift": drift,
+    }
+
+
+@mcp.tool()
+async def get_build_log(
+    repo: str, run_id: int, failed_only: bool = True
+) -> dict:
+    """Fetch logs from a workflow run. With `failed_only=True` (default),
+    returns only the jobs that failed and tail of each job's log — useful
+    when CI failed and the model needs to know what to fix without grabbing
+    600 lines of actions/checkout noise.
+
+    The `run_id` is the `id` field from `get_app_status`'s `latest_build_run`
+    or any workflow run URL.
+    """
+    gh, _ = _current_user()
+    jobs_payload = await gh.list_run_jobs(OWNER, repo, run_id)
+    jobs = jobs_payload.get("jobs", [])
+
+    out: list[dict] = []
+    for job in jobs:
+        if failed_only and job.get("conclusion") not in {"failure", "cancelled", "timed_out"}:
+            continue
+        try:
+            log_text = await gh.get_job_log(OWNER, repo, job["id"])
+        except Exception as e:
+            log_text = f"(failed to fetch log: {e})"
+        # Pull failed steps from the job's `steps` array for context.
+        failed_steps = [
+            s.get("name") for s in (job.get("steps") or [])
+            if s.get("conclusion") in {"failure", "cancelled", "timed_out"}
+        ]
+        # Trim the log to its tail to keep response size sane.
+        excerpt = log_text[-8000:] if log_text and len(log_text) > 8000 else log_text
+        out.append({
+            "job_id": job.get("id"),
+            "job_name": job.get("name"),
+            "conclusion": job.get("conclusion"),
+            "failed_steps": failed_steps,
+            "url": job.get("html_url"),
+            "log_tail": excerpt,
+        })
+
+    return {
+        "run_id": run_id,
+        "filtered_to_failed": failed_only,
+        "jobs": out,
+    }
+
+
+@mcp.tool()
+async def dispatch_workflow(
+    repo: str, workflow: str = "build-image.yml", ref: str = "main"
+) -> dict:
+    """Trigger a workflow_dispatch on a given workflow file. Useful when the
+    release-please → build-image chain misfires (GitHub suppresses workflow
+    triggers from events authored by GITHUB_TOKEN), or any time you want to
+    force a rebuild without pushing a commit.
+
+    `workflow` is the filename under `.github/workflows/`. Default is
+    `build-image.yml`. Returns immediately; poll `get_app_status` for the
+    new run.
+    """
+    gh, _ = _current_user()
+    await gh.dispatch_workflow(OWNER, repo, workflow, ref)
+    return {
+        "status": "dispatched",
+        "repo": f"{OWNER}/{repo}",
+        "workflow": workflow,
+        "ref": ref,
+        "next": (
+            "GitHub queues the run asynchronously. Call get_app_status in "
+            "10-30s to see the new latest_build_run."
+        ),
+    }
+
+
+@mcp.tool()
+def get_template_conventions(template: str) -> dict:
+    """Returns the curated non-obvious lint rules, idioms, and common
+    pitfalls for a given template. Read this BEFORE writing significant
+    code in a repo of that template — it pre-empts the most common CI
+    failures (strict-mode TypeScript, Biome warnings, React compiler
+    rules, Go stdlib-only conventions, etc.).
+
+    Valid template names: react-vibe-template, react-go-template,
+    gohtmx-vibe-template, html-vibe-template.
+    """
+    conventions = get_conventions(template)
+    if conventions is None:
+        return {
+            "error": f"unknown template '{template}'",
+            "valid_templates": list_template_names(),
+        }
+    return {"template": template, **conventions}
 
 
 @mcp.tool()
