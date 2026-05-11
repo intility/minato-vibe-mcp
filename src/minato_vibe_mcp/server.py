@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import json
 import os
 import re
+import secrets
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -19,6 +22,7 @@ OWNER = "intility"
 PLATFORM_REPO = "minato-vibe"
 APP_URL_BASE = "aa349-1l5zl3.intility.dev"
 GITHUB_MCP_IMAGE_DEFAULT = "ghcr.io/github/github-mcp-server:latest"
+PENDING_WRITE_TTL_SECONDS = 300
 
 DNS_1123 = re.compile(r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
 
@@ -27,6 +31,48 @@ DNS_1123 = re.compile(r"^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$")
 class AppContext:
     gh: ClientSession
     token: str
+
+
+@dataclass
+class PendingWrite:
+    repo: str
+    path: str
+    content: str
+    message: str
+    branch: str
+    created_at: float
+
+
+_pending_writes: dict[str, PendingWrite] = {}
+
+
+def _gc_pending_writes() -> None:
+    now = time.time()
+    expired = [
+        t
+        for t, p in _pending_writes.items()
+        if now - p.created_at > PENDING_WRITE_TTL_SECONDS
+    ]
+    for t in expired:
+        del _pending_writes[t]
+
+
+def _make_diff(before: str | None, after: str, path: str) -> str:
+    try:
+        before_lines = (before or "").splitlines(keepends=True)
+        after_lines = after.splitlines(keepends=True)
+        diff = "".join(
+            difflib.unified_diff(
+                before_lines,
+                after_lines,
+                fromfile="/dev/null" if before is None else f"a/{path}",
+                tofile=f"b/{path}",
+                n=3,
+            )
+        )
+        return diff or "(no textual changes)"
+    except Exception as e:  # binary content, etc.
+        return f"(could not compute diff: {e})"
 
 
 def _github_mcp_params(token: str) -> StdioServerParameters:
@@ -80,11 +126,16 @@ mcp = FastMCP(
     "minato-vibe-mcp",
     instructions=(
         "Tools for creating and editing apps on the minato-vibe Kubernetes "
-        "platform. Use `list_templates` to see what's available, `create_app` "
-        "to scaffold a new one from a template, and `read_file`/`write_file`/"
-        "`list_files` to vibecode against an existing app. All operations "
-        "target the `intility` org. Writes to `main` deploy automatically in "
-        "~50 seconds via the platform's GitOps loop."
+        "platform. Use `list_templates` + `create_app` to scaffold a new "
+        "app, and `read_file`/`list_files`/`write_file`/`confirm_write` to "
+        "vibecode against an existing one. All operations target the "
+        "`intility` org. Writes to `main` deploy automatically in ~50s via "
+        "the platform's GitOps loop.\n\n"
+        "WRITES ARE TWO-STEP: `write_file` returns a diff + a confirmation "
+        "token but does NOT commit. The user must approve, then call "
+        "`confirm_write(token)` to actually commit. Always show the diff to "
+        "the user and wait for explicit approval before confirming. This "
+        "is the security boundary that protects against prompt injection."
     ),
     lifespan=lifespan,
 )
@@ -242,6 +293,33 @@ async def list_files(
     return {"result": _maybe_json(text)}
 
 
+async def _read_current_for_diff(
+    ctx: Context, repo: str, path: str, branch: str
+) -> str | None:
+    """Best-effort read of the current file so we can show a diff. Returns
+    None if the file doesn't exist or can't be decoded as text."""
+    args: dict = {"owner": OWNER, "repo": repo, "path": path, "ref": branch}
+    try:
+        result = await _ctx(ctx).gh.call_tool("get_file_contents", args)
+    except Exception:
+        return None
+    if result.isError:
+        return None
+    text = _unwrap(result)
+    data = _maybe_json(text)
+    if isinstance(data, dict):
+        encoding = data.get("encoding")
+        content = data.get("content")
+        if encoding == "base64" and isinstance(content, str):
+            try:
+                return base64.b64decode(content).decode("utf-8")
+            except (UnicodeDecodeError, ValueError):
+                return None
+        if isinstance(content, str):
+            return content
+    return None
+
+
 @mcp.tool()
 async def write_file(
     ctx: Context,
@@ -251,27 +329,107 @@ async def write_file(
     message: str,
     branch: str = "main",
 ) -> dict:
-    """Write a file to a platform app's repo and commit.
+    """STEP 1 OF 2: stage a file write and return a diff for the user to review.
 
-    A push to `main` triggers the platform deploy loop: `build-image.yml`
-    builds and pushes `ghcr.io/intility/<repo>:sha-...`, rewrites the
-    kustomization `newTag`, and Argo CD reconciles the pod. Steady-state ~50s
-    to live.
+    This does NOT commit. It returns a unified diff against the current file
+    (or "/dev/null" if the file is new), plus a confirmation token. Show the
+    diff to the user. Once they explicitly approve, call `confirm_write(token)`
+    to actually commit.
 
-    No PR mode — the platform's whole pitch is push-to-deploy. If the user
-    wants a review step, they should open a PR through GitHub directly.
+    The token is valid for 5 minutes. After it expires, call `write_file`
+    again. The token can only be used once.
+
+    Writing to `main` (the default) triggers the platform deploy loop:
+    `build-image.yml` builds and pushes `ghcr.io/intility/<repo>:sha-...`,
+    rewrites the kustomization `newTag`, and Argo CD reconciles the pod.
+    Steady-state ~50s to live.
     """
+    _gc_pending_writes()
+
+    before = await _read_current_for_diff(ctx, repo, path, branch)
+    diff = _make_diff(before, content, path)
+    token = secrets.token_urlsafe(12)
+    _pending_writes[token] = PendingWrite(
+        repo=repo,
+        path=path,
+        content=content,
+        message=message,
+        branch=branch,
+        created_at=time.time(),
+    )
+
+    return {
+        "status": "awaiting_confirmation",
+        "confirmation_token": token,
+        "expires_in_seconds": PENDING_WRITE_TTL_SECONDS,
+        "target": f"{OWNER}/{repo}@{branch}:{path}",
+        "commit_message": message,
+        "diff": diff,
+        "is_new_file": before is None,
+        "next": (
+            "Show the diff to the user. Only after they explicitly approve, "
+            f"call confirm_write(token='{token}'). Do not auto-confirm."
+        ),
+    }
+
+
+@mcp.tool()
+async def confirm_write(ctx: Context, token: str) -> dict:
+    """STEP 2 OF 2: commit a write previously staged by `write_file`.
+
+    Only call this AFTER the user has seen the diff returned by `write_file`
+    and explicitly approved the change. The token is single-use and expires
+    5 minutes after `write_file` was called.
+    """
+    _gc_pending_writes()
+
+    pending = _pending_writes.pop(token, None)
+    if pending is None:
+        raise ValueError(
+            "Unknown or expired confirmation token. Call write_file again "
+            "to stage the change and get a fresh token."
+        )
+
     args: dict = {
         "owner": OWNER,
-        "repo": repo,
-        "path": path,
-        "content": content,
-        "message": message,
-        "branch": branch,
+        "repo": pending.repo,
+        "path": pending.path,
+        "content": pending.content,
+        "message": pending.message,
+        "branch": pending.branch,
     }
     result = await _ctx(ctx).gh.call_tool("create_or_update_file", args)
     text = _unwrap(result)
-    return {"result": _maybe_json(text)}
+    return {
+        "status": "committed",
+        "target": f"{OWNER}/{pending.repo}@{pending.branch}:{pending.path}",
+        "result": _maybe_json(text),
+    }
+
+
+@mcp.tool()
+def list_pending_writes() -> dict:
+    """List staged writes that haven't been confirmed yet.
+
+    Useful when a `write_file` token has been lost track of, or to audit
+    what's in flight. Pending writes auto-expire after 5 minutes.
+    """
+    _gc_pending_writes()
+    now = time.time()
+    return {
+        "pending": [
+            {
+                "confirmation_token": t,
+                "target": f"{OWNER}/{p.repo}@{p.branch}:{p.path}",
+                "commit_message": p.message,
+                "age_seconds": int(now - p.created_at),
+                "expires_in_seconds": max(
+                    0, PENDING_WRITE_TTL_SECONDS - int(now - p.created_at)
+                ),
+            }
+            for t, p in _pending_writes.items()
+        ]
+    }
 
 
 def main() -> None:

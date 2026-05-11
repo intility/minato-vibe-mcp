@@ -12,7 +12,21 @@ It is a **thin wrapper around the official [`github-mcp-server`](https://github.
 | `create_app(name, template?, private?, description?)` | Creates `intility/<name>` from the chosen template. Defaults to `react-vibe-template`, public. Returns the repo URL and the expected app URL. |
 | `read_file(repo, path, ref?)` | Reads a file from `intility/<repo>`. Base64 content is decoded for you. |
 | `list_files(repo, path?, ref?)` | Lists a directory in `intility/<repo>`. |
-| `write_file(repo, path, content, message, branch?)` | Writes a file to `intility/<repo>` and commits. Pushing to `main` triggers the platform deploy loop (~50s to live). |
+| `write_file(repo, path, content, message, branch?)` | **Stages** a write. Returns a unified diff and a confirmation token. Does NOT commit. |
+| `confirm_write(token)` | Commits a write previously staged by `write_file`. Single-use, expires 5 minutes after staging. |
+| `list_pending_writes` | Shows staged writes that haven't been confirmed yet. |
+
+## Writes are two-step (the security model)
+
+To protect against prompt injection ([the lethal trifecta](https://simonwillison.net/2023/Apr/14/worst-that-can-happen/)), the MCP never lets the model commit a file in one step. The flow is always:
+
+1. Model calls `write_file(...)` → MCP returns a diff and a confirmation token.
+2. The chat client shows the diff to **you, the human**.
+3. You approve. The model calls `confirm_write(token)` → MCP commits.
+
+The token is single-use, expires after 5 minutes, and lives only in the MCP's memory. A model that's been prompt-injected into writing malicious code still has to surface the diff to you first — and you can deny the confirm call.
+
+This is defense-in-depth, not a guarantee. If you reflexively approve every diff, the protection is gone. Read the diff.
 
 ## Prerequisites
 
