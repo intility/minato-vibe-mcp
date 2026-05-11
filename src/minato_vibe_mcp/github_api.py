@@ -80,7 +80,7 @@ class GitHubClient:
         template_repo: str,
         owner: str,
         name: str,
-        private: bool = False,
+        private: bool = True,
         description: str | None = None,
         include_all_branches: bool = False,
     ) -> dict[str, Any]:

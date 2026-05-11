@@ -163,18 +163,23 @@ async def whoami() -> dict:
 async def create_app(
     name: str,
     template: str = "react-vibe-template",
-    private: bool = False,
     description: str | None = None,
 ) -> dict:
-    """Create a new platform app from a template.
+    """Create a new private platform app from a template.
 
-    The repo is created under `intility/<name>`. On the first push (triggered
-    automatically by template generation), `template-init.yml` substitutes
-    placeholders, registers the app at intility/minato-vibe/apps/<name>.yaml,
-    and self-deletes. The app reaches its URL in ~50 seconds.
+    The repo is created under `intility/<name>` as PRIVATE. There is no
+    option to make it public — the MCP refuses to ever create a public
+    repo, because vibe-coded apps may contain code or data that should
+    not leak. If you genuinely need a public repo, flip its visibility
+    on GitHub after creation (the model can't do that through this MCP).
 
-    Runs as the authenticated GitHub user; the user must be a member of the
-    `intility` org with permission to create repos.
+    On the first push (triggered automatically by template generation),
+    `template-init.yml` substitutes placeholders, registers the app at
+    intility/minato-vibe/apps/<name>.yaml, and self-deletes. The app
+    reaches its URL in ~50 seconds.
+
+    Runs as the authenticated GitHub user; the user must be a member of
+    the `intility` org with permission to create repos.
     """
     _validate_name(name)
     tmpl = get_template(template)
@@ -188,7 +193,7 @@ async def create_app(
         template_repo=tmpl["template_repo"],
         owner=OWNER,
         name=name,
-        private=private,
+        private=True,  # hardcoded; never user-controllable
         description=description,
     )
     return {
