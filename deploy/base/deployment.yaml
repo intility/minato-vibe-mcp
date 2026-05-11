@@ -28,6 +28,10 @@ spec:
           env:
             - name: MINATO_VIBE_MCP_URL
               value: https://minato-vibe-mcp.vibe.intility.dev
+            # Hostname suffix for apps created via the template (NOT the MCP's
+            # own hostname — that's set per-deployment via the kustomize image
+            # override / MCP_URL above). The template's httproute hardcodes
+            # __APP_NAME__.vibe.intility.dev.
             - name: MINATO_VIBE_APP_URL_BASE
               value: vibe.intility.dev
           resources:
