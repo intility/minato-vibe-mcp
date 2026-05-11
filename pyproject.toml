@@ -1,6 +1,6 @@
 [project]
 name = "minato-vibe-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server for creating and editing minato-vibe platform apps. Wraps github-mcp-server."
 readme = "README.md"
 requires-python = ">=3.11"

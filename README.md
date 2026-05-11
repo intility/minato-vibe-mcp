@@ -1,105 +1,98 @@
 # minato-vibe-mcp
 
-MCP server for creating and editing apps on the [minato-vibe](https://github.com/intility/minato-vibe) Kubernetes platform.
+A multi-tenant MCP server for creating and editing apps on the [minato-vibe](https://github.com/intility/minato-vibe) Kubernetes platform.
 
-It is a **thin wrapper around the official [`github-mcp-server`](https://github.com/github/github-mcp-server)**: every GitHub operation is delegated to `github-mcp-server` (spawned as a subprocess), and this server only adds the platform-specific knowledge — which templates exist, the naming rules, the URL pattern, and the platform conventions.
+Each user authenticates with their own GitHub personal access token, which doubles as the Bearer token for the MCP. All operations run as that GitHub user — commits, repo creation, everything — so attribution and authorization are correct out of the box.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `list_templates` | Returns the two golden-path templates (`react-vibe-template`, `react-go-template`) with stack info and the GitHub manual-create URL for each. |
-| `create_app(name, template?, private?, description?)` | Creates `intility/<name>` from the chosen template. Defaults to `react-vibe-template`, public. Returns the repo URL and the expected app URL. |
-| `read_file(repo, path, ref?)` | Reads a file from `intility/<repo>`. Base64 content is decoded for you. |
+| `whoami` | Returns the GitHub identity of the authenticated user. |
+| `list_templates` | Returns the two golden-path templates (`react-vibe-template`, `react-go-template`). |
+| `create_app(name, template?, private?, description?)` | Creates `intility/<name>` from the chosen template, running as the authenticated user. |
+| `read_file(repo, path, ref?)` | Reads a file from `intility/<repo>`. |
 | `list_files(repo, path?, ref?)` | Lists a directory in `intility/<repo>`. |
-| `write_file(repo, path, content, message, branch?)` | **Stages** a write. Returns a unified diff and a confirmation token. Does NOT commit. |
-| `confirm_write(token)` | Commits a write previously staged by `write_file`. Single-use, expires 5 minutes after staging. |
-| `list_pending_writes` | Shows staged writes that haven't been confirmed yet. |
+| `write_file(repo, path, content, message, branch?)` | **Stages** a write. Returns a unified diff + confirmation token. Does NOT commit. |
+| `confirm_write(token)` | Commits a write previously staged by `write_file`. Single-use, expires 5 min, scoped to the user. |
+| `list_pending_writes` | Shows the user's own pending writes. |
 
-## Writes are two-step (the security model)
+## Writes are two-step
 
-To protect against prompt injection ([the lethal trifecta](https://simonwillison.net/2023/Apr/14/worst-that-can-happen/)), the MCP never lets the model commit a file in one step. The flow is always:
+To protect against prompt injection (the [lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/)), the MCP never lets the model commit in a single step:
 
 1. Model calls `write_file(...)` → MCP returns a diff and a confirmation token.
-2. The chat client shows the diff to **you, the human**.
-3. You approve. The model calls `confirm_write(token)` → MCP commits.
+2. Chat client shows the diff to **you, the human**.
+3. You approve. Model calls `confirm_write(token)` → MCP commits.
 
-The token is single-use, expires after 5 minutes, and lives only in the MCP's memory. A model that's been prompt-injected into writing malicious code still has to surface the diff to you first — and you can deny the confirm call.
+The token is single-use, expires after 5 minutes, lives only in MCP memory, and is scoped to the authenticated user (another user's token can't confirm your pending writes).
 
-This is defense-in-depth, not a guarantee. If you reflexively approve every diff, the protection is gone. Read the diff.
+This is defense-in-depth, not magic. If you reflexively approve every diff, the protection collapses. Read the diff.
 
-## Prerequisites
+## How a user authenticates
 
-- Docker (used to run `github-mcp-server` as a subprocess).
-- A GitHub personal access token with `repo` scope, exported as `GITHUB_TOKEN`.
+1. Create a **fine-grained PAT** at <https://github.com/settings/tokens?type=beta>:
+   - Resource owner: `intility`
+   - Repository access: pick the repos you want the MCP to touch (or "All repositories" if you want new apps you create to be auto-included).
+   - Repository permissions: **Contents: read & write**, **Metadata: read**, **Administration: write** (the last is needed to create new repos from templates).
+2. Paste the token into your chat client as the Bearer credential for this MCP.
 
-If you'd rather use a native `github-mcp-server` binary instead of Docker, set `GITHUB_MCP_COMMAND=/path/to/github-mcp-server`.
+GitHub's own scoping is the outer lock: even if the model is fully prompt-injected, it cannot reach repos outside what you ticked.
 
-## Install
+## Configure in a chat client
 
-```sh
-git clone https://github.com/intility/minato-vibe-mcp
-cd minato-vibe-mcp
-pip install -e .
-```
-
-## Register with your chat client
-
-### Claude Code
-
-```sh
-claude mcp add minato-vibe \
-  --env GITHUB_TOKEN=$GITHUB_TOKEN \
-  -- minato-vibe-mcp
-```
-
-### Claude Desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+### Claude Desktop / Claude Code (custom headers)
 
 ```json
 {
   "mcpServers": {
     "minato-vibe": {
-      "command": "minato-vibe-mcp",
-      "env": {
-        "GITHUB_TOKEN": "ghp_..."
+      "url": "https://minato-vibe-mcp.aa349-1l5zl3.intility.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer github_pat_xxx"
       }
     }
   }
 }
 ```
 
-## How it works
+### ChatGPT, Claude.ai web
 
-```
-Your chat client
-    │  MCP stdio
-    ▼
-minato-vibe-mcp                ← this project
-    │  MCP stdio (internal)
-    ▼
-github-mcp-server (Docker)
-    │
-    ▼
-api.github.com
+These clients require full OAuth flow per the MCP spec. v0.3 supports Bearer tokens only; OAuth is a future version. Use Claude Desktop or Claude Code for now.
+
+## Run locally
+
+```sh
+pip install -e .
+MINATO_VIBE_MCP_PORT=8000 minato-vibe-mcp
+# listens on http://127.0.0.1:8000/mcp
 ```
 
-The wrapper spawns `github-mcp-server` on startup, keeps the session open for the life of the process, and forwards tool calls to it after injecting `owner=intility` and other platform defaults.
+## Configuration
 
-The one exception is `create_app`: GitHub's "create from template" endpoint (`POST /repos/{owner}/{repo}/generate`) is not exposed by `github-mcp-server`, so this server calls it directly using the same `GITHUB_TOKEN`. Everything else goes through the wrapper.
+| Variable | Default | Purpose |
+|---|---|---|
+| `MINATO_VIBE_MCP_HOST` | `0.0.0.0` | Bind address. |
+| `MINATO_VIBE_MCP_PORT` | `8000` | Listen port. |
+| `MINATO_VIBE_MCP_URL` | `http://localhost:8000` | Public URL of the MCP (used as the OAuth resource id in the protected-resource metadata). Set to the public ingress URL when deployed. |
 
-## Environment variables
+## Architecture
 
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `GITHUB_TOKEN` (or `GITHUB_PERSONAL_ACCESS_TOKEN`) | yes | — | PAT with `repo` scope. Passed to `github-mcp-server`. |
-| `GITHUB_MCP_IMAGE` | no | `ghcr.io/github/github-mcp-server:latest` | Pin a specific image. |
-| `GITHUB_MCP_COMMAND` | no | — | Path to a native `github-mcp-server` binary. If set, Docker is not used. |
+```
+   Chat client (Claude Desktop / Code / etc.)
+            │  MCP over Streamable HTTP
+            │  Authorization: Bearer <user's GitHub PAT>
+            ▼
+   minato-vibe-mcp  (this server, single replica)
+            │
+            └──► api.github.com  (as the authenticated user)
+```
 
-## Known limitations (v0.1)
+No subprocess wrapper, no shared credentials, no Postgres. Per-user pending writes in memory (lost on restart; users just re-stage).
 
-- No deploy-status tool: after `write_file` to `main`, watch via GitHub Actions or `kubectl get application -n argocd`.
-- No pod-logs tool.
-- No PR / branch mode for writes — commits go straight to the chosen branch (`main` by default), matching the platform's push-to-deploy model.
-- A confused model can commit broken code; the platform's per-app isolation limits the blast radius. Recovery is `git revert` via GitHub.
+## Known gaps (v0.3)
+
+- No OAuth flow yet — Bearer PAT only. Limits which chat clients work out of the box.
+- No deploy-status tool (`get_deploy_status` was descoped; check GitHub Actions or `kubectl get application -n argocd` for now).
+- Pending writes are in-memory; restart wipes them.
+- A confused model can still commit broken code *to repos the user's token allows*. Recovery is `git revert` on GitHub.
