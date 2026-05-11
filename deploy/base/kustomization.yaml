@@ -22,4 +22,4 @@ images:
   # the app registers. CI's first build rewrites both newName and newTag.
   - name: app
     newName: ghcr.io/intility/minato-vibe-mcp
-    newTag: sha-6f4b361
+    newTag: sha-3006151
